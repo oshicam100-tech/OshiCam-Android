@@ -1,20 +1,36 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
 
+// ↓↓↓ 追加: local.properties からAPIキーを読み込む ↓↓↓
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { stream -> localProperties.load(stream) }
+}
+// ↑↑↑ 追加ここまで ↑↑↑
+
 android {
-    namespace = "com.example.oshicam"
+    namespace = "com.sato.oshicam"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.oshicam"
+        applicationId = "com.sato.oshicam"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 4
+        versionName = "1.03"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // ↓↓↓ 追加: APIキーをコードから参照できるようにする ↓↓↓
+        buildConfigField("String", "REVENUECAT_API_KEY", "\"${localProperties["REVENUECAT_API_KEY"]}\"")
+        buildConfigField("String", "ADMOB_REWARDED_ID", "\"${localProperties["ADMOB_REWARDED_ID"]}\"")
+        buildConfigField("String", "ADMOB_INTERSTITIAL_ID", "\"${localProperties["ADMOB_INTERSTITIAL_ID"]}\"")
+        // ↑↑↑ 追加ここまで ↑↑↑
     }
 
     buildTypes {
@@ -32,6 +48,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true  // ↓ 追加: BuildConfig を有効にする
     }
 }
 
@@ -57,7 +74,7 @@ dependencies {
     implementation("com.google.mlkit:object-detection:17.0.2")
     implementation("com.google.mlkit:face-detection:16.1.6")
 
-    // ★修正：現在最も安定している最新の完全版FFmpeg(libx264内包)
+    // FFmpeg
     implementation("com.antonkarpenko:ffmpeg-kit-full-gpl:2.1.0")
 
     // 課金管理
