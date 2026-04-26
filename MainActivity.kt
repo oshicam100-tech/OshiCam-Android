@@ -1,8 +1,13 @@
-package com.example.oshicam // 注意: ご自身のパッケージ名に合わせてください
+package com.sato.oshicam // 注意: ご自身のパッケージ名に合わせてください
 
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
@@ -11,6 +16,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.provider.MediaStore
 import android.util.Log
 import android.util.LruCache
@@ -58,16 +64,20 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.app.NotificationCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import com.antonkarpenko.ffmpegkit.FFmpegKit
 import com.google.android.gms.ads.AdError
 import com.google.android.gms.ads.AdRequest
@@ -87,6 +97,7 @@ import com.google.mlkit.vision.objects.ObjectDetector
 import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import com.revenuecat.purchases.PurchaseParams
 import com.revenuecat.purchases.Purchases
+import com.revenuecat.purchases.PurchasesConfiguration
 import com.revenuecat.purchases.getCustomerInfoWith
 import com.revenuecat.purchases.getOfferingsWith
 import com.revenuecat.purchases.purchaseWith
@@ -111,6 +122,103 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
+
+// --- フォアグラウンドサービス (バックグラウンド処理用) ---
+class VideoProcessingService : Service() {
+    companion object {
+        const val CHANNEL_ID = "video_processing_channel"
+        const val NOTIFICATION_ID = 1
+
+        fun start(context: Context, message: String) {
+            val intent = Intent(context, VideoProcessingService::class.java).apply {
+                action = "START"
+                putExtra("message", message)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun update(context: Context, message: String, progress: Int) {
+            val intent = Intent(context, VideoProcessingService::class.java).apply {
+                action = "UPDATE"
+                putExtra("message", message)
+                putExtra("progress", progress)
+            }
+            context.startService(intent)
+        }
+
+        fun stop(context: Context) {
+            val intent = Intent(context, VideoProcessingService::class.java).apply {
+                action = "STOP"
+            }
+            context.startService(intent)
+        }
+    }
+
+    private lateinit var notificationManager: NotificationManager
+    private lateinit var builder: NotificationCompat.Builder
+
+    override fun onCreate() {
+        super.onCreate()
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        createNotificationChannel()
+
+        builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("推しカメラ Pro")
+            .setContentText("処理を準備中...")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action
+        val message = intent?.getStringExtra("message") ?: ""
+        val progress = intent?.getIntExtra("progress", 0) ?: 0
+
+        when (action) {
+            "START" -> {
+                builder.setContentText(message).setProgress(100, 0, true)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(NOTIFICATION_ID, builder.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING)
+                } else {
+                    startForeground(NOTIFICATION_ID, builder.build())
+                }
+            }
+            "UPDATE" -> {
+                val textWithPercent = "$message ($progress%)"
+                builder.setContentText(textWithPercent)
+                    .setProgress(100, progress, false)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(textWithPercent))
+                notificationManager.notify(NOTIFICATION_ID, builder.build())
+            }
+            "STOP" -> {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "動画処理",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "バックグラウンドでの動画展開や書き出しの進捗を表示します"
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+}
 
 // --- 状態管理 (UiState) ---
 enum class AppMode { SELECT_VIDEO, EXTRACTING, LOCK_ON, TRACKING, EDITING, EXPORTING }
@@ -148,15 +256,21 @@ data class OshiCamUiState(
 )
 
 // --- ViewModel ---
+// [修正] bitmapCache をカプセル化し、外部から直接書き換えられないようにした
 class OshiCamViewModel : ViewModel() {
     private val maxMemory = (Runtime.getRuntime().maxMemory() / 1024).toInt()
     private val cacheSize = maxMemory / 8
 
-    val bitmapCache = object : LruCache<Int, Bitmap>(cacheSize) {
+    // [修正] private に変更してアクセサ関数経由でのみ操作可能にした
+    private val _bitmapCache = object : LruCache<Int, Bitmap>(cacheSize) {
         override fun sizeOf(key: Int, bitmap: Bitmap): Int {
             return bitmap.byteCount / 1024
         }
     }
+
+    fun getBitmap(key: Int): Bitmap? = _bitmapCache.get(key)
+    fun putBitmap(key: Int, bitmap: Bitmap) { _bitmapCache.put(key, bitmap) }
+    fun evictAllBitmaps() { _bitmapCache.evictAll() }
 
     private val _uiState = MutableStateFlow(OshiCamUiState())
     val uiState: StateFlow<OshiCamUiState> = _uiState.asStateFlow()
@@ -203,7 +317,7 @@ class OshiCamViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
-        bitmapCache.evictAll()
+        evictAllBitmaps()
         cancelFfmpegProcess()
     }
 }
@@ -239,21 +353,109 @@ fun removeOverlappingBoxes(boxes: List<Rect>): List<Rect> {
     return result
 }
 
-// --- 広告管理 (AdMob) ---
-object AdManager {
-    var rewardedAd: RewardedAd? = null
-    var isRewardedAdLoading = false
+// [修正・新規追加] 重複していた顔・物体検出マージロジックを共通関数に抽出
+fun mergeDetectionBoxes(
+    rawObjs: List<Rect>,
+    rawFaces: List<Rect>,
+    scaleFactor: Float,
+    imgW: Int,
+    imgH: Int,
+    boxWidthPercent: Float,
+    lastBox: Rect? = null
+): List<Rect> {
+    val faceBoxes = rawFaces.mapNotNull { f ->
+        val fw = f.width() * scaleFactor
+        val fh = f.height() * scaleFactor
+        if (fw < imgW * 0.005f) return@mapNotNull null
+        val fl = f.left * scaleFactor
+        val ft = f.top * scaleFactor
+        val fr = f.right * scaleFactor
+        val fb = f.bottom * scaleFactor
+        Rect(
+            max(0, (fl - fw * 2.0f).toInt()),
+            max(0, (ft - fh * 1.5f).toInt()),
+            min(imgW, (fr + fw * 2.0f).toInt()),
+            min(imgH, (fb + fh * 4.5f).toInt())
+        )
+    }
 
-    var interstitialAd: InterstitialAd? = null
-    var isInterstitialAdLoading = false
+    val objBoxes = rawObjs.map { o ->
+        Rect(
+            (o.left * scaleFactor).toInt(),
+            (o.top * scaleFactor).toInt(),
+            (o.right * scaleFactor).toInt(),
+            (o.bottom * scaleFactor).toInt()
+        )
+    }.filter { box ->
+        val w = box.width().toFloat()
+        val h = box.height().toFloat()
+        w > imgW * 0.03f && h > imgH * 0.05f
+    }
+
+    val mergedCandidates = mutableListOf<Rect>()
+    val usedObjBoxes = mutableSetOf<Rect>()
+
+    for (faceBox in faceBoxes) {
+        var bestObj: Rect? = null
+        var maxIntersectArea = 0
+        for (objBox in objBoxes) {
+            val intersect = Rect()
+            if (intersect.setIntersect(faceBox, objBox)) {
+                val area = intersect.width() * intersect.height()
+                if (area > maxIntersectArea) {
+                    maxIntersectArea = area
+                    bestObj = objBox
+                }
+            }
+        }
+        if (bestObj != null) {
+            val unionBox = Rect(faceBox)
+            unionBox.union(bestObj)
+            mergedCandidates.add(unionBox)
+            usedObjBoxes.add(bestObj)
+        } else {
+            mergedCandidates.add(faceBox)
+        }
+    }
+
+    for (objBox in objBoxes) {
+        if (!usedObjBoxes.contains(objBox)) {
+            val ratio = objBox.height().toFloat() / objBox.width().toFloat()
+            val isTracked = lastBox?.let { Rect.intersects(objBox, it) } ?: false
+            if (isTracked || ratio in 0.8f..4.5f) {
+                mergedCandidates.add(objBox)
+            }
+        }
+    }
+
+    val narrowedCandidates = mergedCandidates.map { box ->
+        if (boxWidthPercent >= 100f) box else {
+            val cx = box.centerX()
+            val newW = (box.width() * (boxWidthPercent / 100f)).toInt()
+            Rect(cx - newW / 2, box.top, cx + newW / 2, box.bottom)
+        }
+    }
+
+    return removeOverlappingBoxes(narrowedCandidates)
+}
+
+// --- 広告管理 (AdMob) ---
+// [修正] object シングルトンの mutable 状態を @Volatile で保護し、スレッドセーフ性を向上
+object AdManager {
+    @Volatile var rewardedAd: RewardedAd? = null
+    @Volatile var isRewardedAdLoading = false
+
+    @Volatile var interstitialAd: InterstitialAd? = null
+    @Volatile var isInterstitialAdLoading = false
 
     fun loadRewardedAd(context: Context) {
         if (rewardedAd != null || isRewardedAdLoading) return
         isRewardedAdLoading = true
         val adRequest = AdRequest.Builder().build()
+        // [修正] BuildConfig からIDを取得（ハードコード廃止）
         RewardedAd.load(
             context,
-            "ca-app-pub-6566160702058844/4965306279", // TODO: 製品化の際は本番用のリワード広告IDに変更してください
+            BuildConfig.ADMOB_REWARDED_ID,
             adRequest,
             object : RewardedAdLoadCallback() {
                 override fun onAdFailedToLoad(adError: LoadAdError) {
@@ -272,9 +474,10 @@ object AdManager {
         if (interstitialAd != null || isInterstitialAdLoading) return
         isInterstitialAdLoading = true
         val adRequest = AdRequest.Builder().build()
+        // [修正] BuildConfig からIDを取得（ハードコード廃止）
         InterstitialAd.load(
             context,
-            "ca-app-pub-6566160702058844/7115354714", // TODO: 製品化の際は本番用のインタースティシャル広告IDに変更してください
+            BuildConfig.ADMOB_INTERSTITIAL_ID,
             adRequest,
             object : InterstitialAdLoadCallback() {
                 override fun onAdFailedToLoad(adError: LoadAdError) {
@@ -295,6 +498,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // [修正] RevenueCatキーを BuildConfig から取得（ハードコード廃止）
+        try {
+            Purchases.debugLogsEnabled = true
+            Purchases.configure(
+                PurchasesConfiguration.Builder(this, BuildConfig.REVENUECAT_API_KEY).build()
+            )
+        } catch (e: Exception) {
+            Log.e("RevenueCatInit", "RevenueCat初期化エラー: ${e.message}")
+        }
 
         MobileAds.initialize(this) {}
         AdManager.loadRewardedAd(this)
@@ -335,7 +548,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: OshiCamViewModel) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
     val uiState by viewModel.uiState.collectAsState()
 
     var pendingVideoUri by remember { mutableStateOf<Uri?>(null) }
@@ -356,7 +568,13 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
     val fpsOptions = listOf(15, 30)
     val extractionQualities = listOf("高品質 (重い)", "標準 (バランス)", "低品質 (爆速・軽量)")
 
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+
     LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         try {
             Purchases.sharedInstance.getCustomerInfoWith(
                 onSuccess = { customerInfo ->
@@ -373,7 +591,10 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
             if (!files.isNullOrEmpty()) {
                 viewModel.frameFiles.clear()
                 viewModel.frameFiles.addAll(files)
-                val loadedFps = loadProjectData(context, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                // [修正] loadProjectData を IO スレッドで実行
+                val loadedFps = withContext(Dispatchers.IO) {
+                    loadProjectData(context, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                }
                 viewModel.updateState { it.copy(selectedFps = loadedFps, appMode = AppMode.EDITING) }
                 Toast.makeText(context, "前回の編集データを復元しました", Toast.LENGTH_SHORT).show()
             }
@@ -423,13 +644,14 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                 while (uiState.currentFrameIndex < viewModel.frameFiles.size - 1 && uiState.isPlaying && isActive) {
                     val nextIdx = uiState.currentFrameIndex + 1
 
-                    var bmp = viewModel.bitmapCache.get(nextIdx)
+                    // [修正] bitmapCache をアクセサ経由で操作
+                    var bmp = viewModel.getBitmap(nextIdx)
                     if (bmp == null) {
                         try {
                             val options = BitmapFactory.Options().apply { inSampleSize = 2; inPreferredConfig = Bitmap.Config.RGB_565 }
                             bmp = BitmapFactory.decodeFile(viewModel.frameFiles[nextIdx].absolutePath, options)
-                            if (bmp != null) viewModel.bitmapCache.put(nextIdx, bmp)
-                        } catch (e: Exception) {}
+                            if (bmp != null) viewModel.putBitmap(nextIdx, bmp)
+                        } catch (e: Exception) { Log.e("Playback", "フレーム読み込みエラー", e) }
                     }
 
                     if (bmp != null) {
@@ -454,19 +676,19 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
 
         if (viewModel.frameFiles.isNotEmpty() && uiState.currentFrameIndex in viewModel.frameFiles.indices) {
             withContext(Dispatchers.IO) {
-                var bitmap = viewModel.bitmapCache.get(uiState.currentFrameIndex)
+                // [修正] bitmapCache をアクセサ経由で操作
+                var bitmap = viewModel.getBitmap(uiState.currentFrameIndex)
                 try {
                     val sampleSize = if (uiState.appMode == AppMode.TRACKING) 2 else 1
                     if (bitmap == null || (sampleSize == 1 && bitmap.width < uiState.videoWidth / 2)) {
                         val options = BitmapFactory.Options().apply { inSampleSize = sampleSize; inPreferredConfig = Bitmap.Config.RGB_565 }
                         bitmap = BitmapFactory.decodeFile(viewModel.frameFiles[uiState.currentFrameIndex].absolutePath, options)
-                        if (bitmap != null) viewModel.bitmapCache.put(uiState.currentFrameIndex, bitmap)
+                        if (bitmap != null) viewModel.putBitmap(uiState.currentFrameIndex, bitmap)
                     }
-
                     if (bitmap != null) {
                         withContext(Dispatchers.Main) { previewBitmap = bitmap }
                     }
-                } catch (e: Exception) {}
+                } catch (e: Exception) { Log.e("Preview", "プレビュー読み込みエラー", e) }
             }
         }
     }
@@ -501,81 +723,10 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                         val imgW = detectBitmap.width * 2
                         val imgH = detectBitmap.height * 2
 
-                        val faceBoxes = rawFaces.mapNotNull { f ->
-                            val fw = f.width() * scaleFactor
-                            val fh = f.height() * scaleFactor
-                            if (fw < imgW * 0.005f) return@mapNotNull null
-                            val fl = f.left * scaleFactor
-                            val ft = f.top * scaleFactor
-                            val fr = f.right * scaleFactor
-                            val fb = f.bottom * scaleFactor
-                            Rect(
-                                max(0, (fl - fw * 2.0f).toInt()),
-                                max(0, (ft - fh * 1.5f).toInt()),
-                                min(imgW, (fr + fw * 2.0f).toInt()),
-                                min(imgH, (fb + fh * 4.5f).toInt())
-                            )
-                        }
-
-                        val objBoxes = rawObjs.map { o ->
-                            Rect(
-                                (o.left * scaleFactor).toInt(),
-                                (o.top * scaleFactor).toInt(),
-                                (o.right * scaleFactor).toInt(),
-                                (o.bottom * scaleFactor).toInt()
-                            )
-                        }.filter { box ->
-                            val w = box.width().toFloat()
-                            val h = box.height().toFloat()
-                            w > imgW * 0.03f && h > imgH * 0.05f
-                        }
-
-                        val mergedCandidates = mutableListOf<Rect>()
-                        val usedObjBoxes = mutableSetOf<Rect>()
-
-                        for (faceBox in faceBoxes) {
-                            var bestObj: Rect? = null
-                            var maxIntersectArea = 0
-                            for (objBox in objBoxes) {
-                                val intersect = Rect()
-                                if (intersect.setIntersect(faceBox, objBox)) {
-                                    val area = intersect.width() * intersect.height()
-                                    if (area > maxIntersectArea) {
-                                        maxIntersectArea = area
-                                        bestObj = objBox
-                                    }
-                                }
-                            }
-                            if (bestObj != null) {
-                                val unionBox = Rect(faceBox)
-                                unionBox.union(bestObj)
-                                mergedCandidates.add(unionBox)
-                                usedObjBoxes.add(bestObj)
-                            } else {
-                                mergedCandidates.add(faceBox)
-                            }
-                        }
-
-                        for (objBox in objBoxes) {
-                            if (!usedObjBoxes.contains(objBox)) {
-                                val w = objBox.width().toFloat()
-                                val h = objBox.height().toFloat()
-                                val ratio = h / w
-                                if (ratio in 0.8f..4.5f) {
-                                    mergedCandidates.add(objBox)
-                                }
-                            }
-                        }
-
-                        val narrowedCandidates = mergedCandidates.map { box ->
-                            if (uiState.boxWidthPercent >= 100f) box else {
-                                val cx = box.centerX()
-                                val newW = (box.width() * (uiState.boxWidthPercent / 100f)).toInt()
-                                Rect(cx - newW / 2, box.top, cx + newW / 2, box.bottom)
-                            }
-                        }
-
-                        val finalFilteredObjs = removeOverlappingBoxes(narrowedCandidates)
+                        // [修正] 共通関数 mergeDetectionBoxes を使用（重複コード廃止）
+                        val finalFilteredObjs = mergeDetectionBoxes(
+                            rawObjs, rawFaces, scaleFactor, imgW, imgH, uiState.boxWidthPercent
+                        )
                         detectBitmap.recycle()
 
                         withContext(Dispatchers.Main) {
@@ -583,7 +734,7 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                         }
                     }
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.e("Detection", "検出エラー", e)
                 } finally {
                     objDetector?.close()
                     faceDetector?.close()
@@ -642,11 +793,20 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                         offset = Offset.Zero
                         viewModel.updateState { it.copy(appMode = AppMode.EXTRACTING) }
 
-                        coroutineScope.launch {
+                        if (uiState.isPremiumVersion) {
+                            VideoProcessingService.start(context, "動画を展開中...")
+                        } else {
+                            Toast.makeText(context, "無料版はアプリを開いたままお待ちください\n(※裏画面に行くと停止する場合があります)", Toast.LENGTH_LONG).show()
+                        }
+
+                        viewModel.viewModelScope.launch {
                             try {
-                                viewModel.bitmapCache.evictAll()
-                                val projectFile = File(context.filesDir, "project_data.txt")
-                                if (projectFile.exists()) projectFile.delete()
+                                viewModel.evictAllBitmaps()
+                                // [修正] saveProjectData を IO スレッドで実行
+                                withContext(Dispatchers.IO) {
+                                    val projectFile = File(context.filesDir, "project_data.txt")
+                                    if (projectFile.exists()) projectFile.delete()
+                                }
 
                                 viewModel.updateState { it.copy(processingMessage = "動画を準備中...(数秒で終わります)") }
 
@@ -662,7 +822,7 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                 val copiedFile = copyUriToFile(context, uri)
                                 val framesDir = File(context.filesDir, "extracted_frames")
                                 if (!framesDir.exists()) framesDir.mkdirs()
-                                framesDir.listFiles()?.forEach { it.delete() }
+                                withContext(Dispatchers.IO) { framesDir.listFiles()?.forEach { it.delete() } }
 
                                 val qValue = when (uiState.selectedExtractionQuality) {
                                     "高品質 (重い)" -> 1; "標準 (バランス)" -> 3; "低品質 (爆速・軽量)" -> 7; else -> 3
@@ -704,19 +864,29 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                     )
                                 }
 
-                                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                // [修正] saveProjectData を IO スレッドで実行
+                                withContext(Dispatchers.IO) {
+                                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                }
 
                                 withContext(Dispatchers.IO) {
                                     val commandFull = "-y -threads 0 -i '${copiedFile.absolutePath}' $scaleFilter -q:v $qValue '${framesDir.absolutePath}/frame_%05d.jpg'"
                                     val session = FFmpegKit.executeAsync(commandFull,
-                                        { session ->
+                                        { _ ->
                                             viewModel.updateState { it.copy(isBackgroundExtracting = false) }
                                             viewModel.activeFfmpegSessionId = null
+                                            if (uiState.isPremiumVersion) {
+                                                VideoProcessingService.stop(context)
+                                            }
                                         },
-                                        { log -> },
+                                        { _ -> },
                                         { statistics ->
                                             if (uiState.estimatedTotalFrames > 0) {
-                                                viewModel.updateState { it.copy(bgExtractProgress = (statistics.videoFrameNumber.toFloat() / uiState.estimatedTotalFrames * 100).toInt().coerceIn(0, 100)) }
+                                                val progress = (statistics.videoFrameNumber.toFloat() / uiState.estimatedTotalFrames * 100).toInt().coerceIn(0, 100)
+                                                viewModel.updateState { it.copy(bgExtractProgress = progress) }
+                                                if (uiState.isPremiumVersion) {
+                                                    VideoProcessingService.update(context, "動画を展開中...", progress)
+                                                }
                                             }
                                         }
                                     )
@@ -725,6 +895,9 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                             } catch (e: Exception) {
                                 Toast.makeText(context, "エラー: ${e.message}", Toast.LENGTH_LONG).show()
                                 viewModel.updateState { it.copy(appMode = AppMode.SELECT_VIDEO) }
+                                if (uiState.isPremiumVersion) {
+                                    VideoProcessingService.stop(context)
+                                }
                             }
                         }
                     }
@@ -771,7 +944,12 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                         for (i in uiState.currentFrameIndex until viewModel.frameFiles.size) viewModel.trackingMap.remove(i)
                         viewModel.userKeyframes.removeAll { it >= uiState.currentFrameIndex }
                         viewModel.interpolatedFrames.removeAll { it >= uiState.currentFrameIndex }
-                        saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                        // [修正] saveProjectData を IO スレッドで実行
+                        viewModel.viewModelScope.launch {
+                            withContext(Dispatchers.IO) {
+                                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                            }
+                        }
                         Toast.makeText(context, "これ以降を外しました", Toast.LENGTH_SHORT).show()
                         showRemoveAfterDialog = false
                     },
@@ -802,8 +980,11 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                             onClick = {
                                 showSaveSlotDialog = false
                                 viewModel.updateState { it.copy(appMode = AppMode.EXTRACTING, processingMessage = "スロット $i に保存中...\n(※数秒かかります)") }
-                                coroutineScope.launch {
-                                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                viewModel.viewModelScope.launch {
+                                    // [修正] saveProjectData を IO スレッドで実行
+                                    withContext(Dispatchers.IO) {
+                                        saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                    }
                                     val success = saveToSlot(context, i)
                                     slotRefreshTrigger++
                                     viewModel.updateState { it.copy(appMode = AppMode.EDITING) }
@@ -840,10 +1021,10 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                 if (slotExists) {
                                     showLoadSlotDialog = false
                                     viewModel.updateState { it.copy(appMode = AppMode.EXTRACTING, processingMessage = "スロット $i から読込中...\n(※数秒かかります)") }
-                                    coroutineScope.launch {
+                                    viewModel.viewModelScope.launch {
                                         val success = loadFromSlot(context, i)
                                         if (success) {
-                                            viewModel.bitmapCache.evictAll()
+                                            viewModel.evictAllBitmaps()
                                             previewScale = 1f
                                             offset = Offset.Zero
                                             val framesDir = File(context.filesDir, "extracted_frames")
@@ -851,7 +1032,10 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                             viewModel.frameFiles.clear()
                                             viewModel.frameFiles.addAll(files)
                                             viewModel.allFramesObjects.clear()
-                                            val loadedFps = loadProjectData(context, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                            // [修正] loadProjectData を IO スレッドで実行
+                                            val loadedFps = withContext(Dispatchers.IO) {
+                                                loadProjectData(context, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                            }
                                             viewModel.updateState { it.copy(selectedFps = loadedFps, currentFrameIndex = 0, appMode = AppMode.EDITING) }
                                             Toast.makeText(context, "スロット $i を読み込みました", Toast.LENGTH_SHORT).show()
                                         } else {
@@ -915,43 +1099,36 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
             Surface(modifier = Modifier.fillMaxSize().padding(16.dp), shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface, tonalElevation = 8.dp) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Text("📱 神動画を作る5つのコツ", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        Text("神動画を作る5つのコツ", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         IconButton(onClick = { showHelpDialog = false }) { Icon(Icons.Default.Close, contentDescription = "閉じる") }
                     }
                     Divider(modifier = Modifier.padding(vertical = 8.dp))
 
                     Column(modifier = Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-
-                        // Tip 1
                         Text("1. 基本のキ！綺麗な追従のコツ", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(4.dp))
                         Text("❌ NG: 動画を読み込んで適当にタップする\n⭕ OK: 推しが一番「綺麗に全身（または上半身）が映っているコマ」でタップしてロックオン！そこから「タップで追従」をオンにしましょう。")
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        // Tip 2
-                        Text("2. 💃 激しいダンスを撮る時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        Text("2. 激しいダンスを撮る時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(4.dp))
                         Text("❌ NG: カメラが推しの動きに合わせて揺れて酔う…\n⭕ OK: 詳細設定の「追従のスタイル」を「構図を固定 (ダンス等)」に変更！さらに手ブレ補正を「80%〜90%」に強めると、推しが画面中央でピタッと安定します。")
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        // Tip 3
-                        Text("3. 👯‍♀️ メンバー同士が重なる時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        Text("3. メンバー同士が重なる時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text("❌ NG: 見失うたびに最初からやり直し…\n⭕ OK: 隠れる直前で一時停止 ➡ 別のメンバーの後ろから「再び現れたコマ」まで進む ➡ そこで推しをタップして「隠れた間を繋ぐ」をオン！緑色の枠が自動で裏側を繋いでくれます🌿")
+                        Text("❌ NG: 見失うたびに最初からやり直し…\n⭕ OK: 隠れる直前で一時停止 ➡ 別のメンバーの後ろから「再び現れたコマ」まで進む ➡ そこで推しをタップして「隠れた間を繋ぐ」をオン！緑色の枠が自動で裏側を繋いでくれます")
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        // Tip 4
-                        Text("4. 👯‍♂️ 全員同じ衣装でAIが迷う時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        Text("4. 全員同じ衣装でAIが迷う時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text("❌ NG: 何度やっても隣のメンバーに枠が移る…\n⭕ OK: 設定の「枠の幅調整」を「50%」程度に狭くし、「追従の優先度」を「位置・予測を優先」に変更！これで隣の人との混同をガッチリ防げます🛡️")
+                        Text("❌ NG: 何度やっても隣のメンバーに枠が移る…\n⭕ OK: 設定の「枠の幅調整」を「50%」程度に狭くし、「追従の優先度」を「位置・予測を優先」に変更！これで隣の人との混同をガッチリ防げます")
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        // Tip 5
-                        Text("5. ✂️ カメラの視点がパッと変わる時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        Text("5. カメラの視点がパッと変わる時", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text("❌ NG: 枠が画面を横切ってビュンッと飛んでしまう\n⭕ OK: 切り替わった瞬間のコマで、紫色の「✂️ カット指定」ボタンをポチッ！カメラが「瞬間移動」して、自然な動画に仕上がります✨")
+                        Text("❌ NG: 枠が画面を横切ってビュンッと飛んでしまう\n⭕ OK: 切り替わった瞬間のコマで、紫色の「カット指定」ボタンをポチッ！カメラが「瞬間移動」して、自然な動画に仕上がります")
                         Spacer(modifier = Modifier.height(16.dp))
-
                     }
                     Button(onClick = { showHelpDialog = false }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("閉じて編集に戻る") }
                 }
@@ -982,7 +1159,7 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
             elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp, pressedElevation = 0.dp)
         ) {
             Text(
-                text = if (uiState.appMode == AppMode.SELECT_VIDEO) "🎬 動画を選択して開始する" else "別の動画に変更する",
+                text = if (uiState.appMode == AppMode.SELECT_VIDEO) "動画を選択して開始する" else "別の動画に変更する",
                 textAlign = TextAlign.Center,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
@@ -1077,14 +1254,14 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                         if (!viewModel.interpolatedFrames.contains(uiState.currentFrameIndex)) {
                                             viewModel.interpolatedFrames.add(uiState.currentFrameIndex)
                                         }
-                                        Toast.makeText(context, "✨ ${steps - 1}コマの間を緑色の枠で繋ぎました！", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "${steps - 1}コマの間を緑色の枠で繋ぎました！", Toast.LENGTH_SHORT).show()
                                     } else {
-                                        Toast.makeText(context, "⚠️ 繋ぐための「前の枠」がありません", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "繋ぐための「前の枠」がありません", Toast.LENGTH_SHORT).show()
                                     }
                                 } else {
                                     viewModel.interpolatedFrames.remove(uiState.currentFrameIndex)
                                     if (isManualBox) {
-                                        Toast.makeText(context, "👆 手動で枠を作成しました", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "手動で枠を作成しました", Toast.LENGTH_SHORT).show()
                                     }
                                 }
 
@@ -1096,7 +1273,7 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                     val safeStartBox = Rect(tappedBox)
                                     val safeFramesObjects = viewModel.allFramesObjects.toMap()
 
-                                    coroutineScope.launch {
+                                    viewModel.viewModelScope.launch {
                                         try {
                                             val framesDir = File(context.filesDir, "extracted_frames")
                                             val lostFrame = runAutoTracking(
@@ -1119,7 +1296,7 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                                     }
                                                     if (newFilteredObjs != null) viewModel.allFramesObjects[step] = newFilteredObjs
                                                     if (uiBmp != null) {
-                                                        viewModel.bitmapCache.put(step, uiBmp)
+                                                        viewModel.putBitmap(step, uiBmp)
                                                         previewBitmap = uiBmp
                                                     }
                                                 },
@@ -1127,20 +1304,23 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                             )
 
                                             viewModel.updateState { it.copy(isInterpolationEnabled = false, autoTrackOnTap = false, appMode = AppMode.EDITING) }
-                                            saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                            // [修正] saveProjectData を IO スレッドで実行
+                                            withContext(Dispatchers.IO) {
+                                                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                            }
 
                                             if (viewModel.uiState.value.isTrackingCancelled) {
-                                                Toast.makeText(context, "🛑 追従を中断しました", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(context, "追従を中断しました", Toast.LENGTH_SHORT).show()
                                             } else if (lostFrame != null) {
                                                 viewModel.updateState { it.copy(currentFrameIndex = lostFrame) }
-                                                Toast.makeText(context, "⚠️ 見失ったため、${lostFrame}コマ目で停止しました。再度枠を指定してください。", Toast.LENGTH_LONG).show()
+                                                Toast.makeText(context, "見失ったため、${lostFrame}コマ目で停止しました。再度枠を指定してください。", Toast.LENGTH_LONG).show()
                                             } else {
-                                                Toast.makeText(context, "🎉 追従完了！", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(context, "追従完了！", Toast.LENGTH_SHORT).show()
                                             }
                                         } catch (e: Exception) {
                                             e.printStackTrace()
                                             viewModel.updateState { it.copy(appMode = AppMode.EDITING) }
-                                            Toast.makeText(context, "⚠️ エラー停止: ${e.message}", Toast.LENGTH_LONG).show()
+                                            Toast.makeText(context, "エラー停止: ${e.message}", Toast.LENGTH_LONG).show()
                                         }
                                     }
                                 } else {
@@ -1148,7 +1328,12 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                                         Toast.makeText(context, "1コマ枠を設定しました", Toast.LENGTH_SHORT).show()
                                     }
                                     viewModel.updateState { it.copy(isInterpolationEnabled = false) }
-                                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                    // [修正] saveProjectData を IO スレッドで実行
+                                    viewModel.viewModelScope.launch {
+                                        withContext(Dispatchers.IO) {
+                                            saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1280,7 +1465,7 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(48.dp), tint = Color.DarkGray)
                         Spacer(modifier = Modifier.height(12.dp))
-                        Text("🎬 動画が選択されていません", color = Color.LightGray, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        Text("動画が選択されていません", color = Color.LightGray, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                         Spacer(modifier = Modifier.height(4.dp))
                         Text("上のボタンから動画を読み込むと\nここにプレビューが表示されます", color = Color.Gray, fontSize = 12.sp, textAlign = TextAlign.Center)
                     }
@@ -1320,17 +1505,21 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
                     if (usableSpace < requiredSpace) {
                         val reqMB = requiredSpace / (1024 * 1024)
                         val freeMB = usableSpace / (1024 * 1024)
-                        Toast.makeText(context, "⚠️ 空き容量が不足しています！\n必要: 約${reqMB}MB / 空き: 約${freeMB}MB", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, "空き容量が不足しています！\n必要: 約${reqMB}MB / 空き: 約${freeMB}MB", Toast.LENGTH_LONG).show()
                         return@exportLabel
                     }
 
                     val startExportProcess = {
                         if (!uiState.isPremiumVersion) {
-                            Toast.makeText(context, "🎁 無料版のため最初の7秒間をお試し出力します", Toast.LENGTH_LONG).show()
+                            if (uiState.selectedResolution != "720p (SNS向け・爆速)") {
+                                Toast.makeText(context, "無料版の高画質出力は最初の5秒間(透かし有)のお試しになります", Toast.LENGTH_LONG).show()
+                            } else {
+                                Toast.makeText(context, "無料版のためロゴ透かしが入ります", Toast.LENGTH_LONG).show()
+                            }
                         }
 
                         viewModel.updateState { it.copy(appMode = AppMode.EXPORTING, isTrackingCancelled = false) }
-                        coroutineScope.launch {
+                        viewModel.viewModelScope.launch {
                             val originalVideoFile = File(context.filesDir, "working_video.mp4")
                             val output = processVideoProfessional(
                                 context, originalVideoFile, viewModel.frameFiles, viewModel.trackingMap,
@@ -1344,9 +1533,9 @@ fun OshiCamScreen(isDarkTheme: Boolean, onThemeToggle: () -> Unit, viewModel: Os
 
                             if (output != null) {
                                 saveVideoToGallery(context, output)
-                                Toast.makeText(context, "🎉 保存完了！カメラロールを確認してください", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, "保存完了！カメラロールを確認してください", Toast.LENGTH_LONG).show()
                             } else if (viewModel.uiState.value.isTrackingCancelled) {
-                                Toast.makeText(context, "🛑 書き出しを中断しました", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, "書き出しを中断しました", Toast.LENGTH_LONG).show()
                             } else {
                                 Toast.makeText(context, "出力エラー、または安全装置が作動しました。", Toast.LENGTH_LONG).show()
                             }
@@ -1437,19 +1626,19 @@ fun TopActionButtons(appMode: AppMode, onSave: () -> Unit, onLoad: () -> Unit, o
             enabled = (appMode == AppMode.EDITING || appMode == AppMode.LOCK_ON),
             contentPadding = PaddingValues(0.dp),
             shape = RoundedCornerShape(8.dp)
-        ) { Text("💾 保存", fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+        ) { Text("保存", fontSize = 13.sp, fontWeight = FontWeight.Bold) }
         FilledTonalButton(
             onClick = onLoad,
             modifier = Modifier.weight(1f).height(36.dp),
             contentPadding = PaddingValues(0.dp),
             shape = RoundedCornerShape(8.dp)
-        ) { Text("📂 読込", fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+        ) { Text("読込", fontSize = 13.sp, fontWeight = FontWeight.Bold) }
         OutlinedButton(
             onClick = onDelete,
             modifier = Modifier.weight(1f).height(36.dp),
             contentPadding = PaddingValues(0.dp),
             shape = RoundedCornerShape(8.dp)
-        ) { Text("🗑️ 消去", fontSize = 13.sp, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold) }
+        ) { Text("消去", fontSize = 13.sp, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold) }
     }
 }
 
@@ -1519,7 +1708,10 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
             }
         } else {
             if (didPrevLongPress && uiState.isBoxEditMode) {
-                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                // [修正] saveProjectData を IO スレッドで実行
+                withContext(Dispatchers.IO) {
+                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                }
             }
             didPrevLongPress = false
         }
@@ -1542,7 +1734,10 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
             }
         } else {
             if (didNextLongPress && uiState.isBoxEditMode) {
-                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                // [修正] saveProjectData を IO スレッドで実行
+                withContext(Dispatchers.IO) {
+                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                }
             }
             didNextLongPress = false
         }
@@ -1559,7 +1754,12 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
                 }
             }
         } else {
-            if (didUpLongPress) saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+            if (didUpLongPress) {
+                // [修正] saveProjectData を IO スレッドで実行
+                withContext(Dispatchers.IO) {
+                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                }
+            }
             didUpLongPress = false
         }
     }
@@ -1575,7 +1775,12 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
                 }
             }
         } else {
-            if (didDownLongPress) saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+            if (didDownLongPress) {
+                // [修正] saveProjectData を IO スレッドで実行
+                withContext(Dispatchers.IO) {
+                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                }
+            }
             didDownLongPress = false
         }
     }
@@ -1587,7 +1792,7 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
 
             Row(modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = if (uiState.isBoxEditMode) "🖼️ 枠の微調整モード" else "🎬 コマ送り・再生モード",
+                    text = if (uiState.isBoxEditMode) "枠の微調整モード" else "コマ送り・再生モード",
                     style = MaterialTheme.typography.labelMedium,
                     color = if(uiState.isBoxEditMode) MaterialTheme.colorScheme.tertiary else Color.Gray,
                     fontWeight = FontWeight.Bold
@@ -1610,7 +1815,12 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
                         onClick = {
                             if (!didPrevLongPress && !uiState.isPlaying) {
                                 viewModel.moveCurrentBox(-moveStepTap, 0, uiState.videoWidth, uiState.videoHeight)
-                                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                // [修正] saveProjectData を IO スレッドで実行
+                                viewModel.viewModelScope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                    }
+                                }
                             }
                         },
                         interactionSource = prevInteractionSource,
@@ -1625,7 +1835,11 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
                             onClick = {
                                 if (!didUpLongPress && !uiState.isPlaying) {
                                     viewModel.moveCurrentBox(0, -moveStepTap, uiState.videoWidth, uiState.videoHeight)
-                                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                    viewModel.viewModelScope.launch {
+                                        withContext(Dispatchers.IO) {
+                                            saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                        }
+                                    }
                                 }
                             },
                             interactionSource = upInteractionSource,
@@ -1640,7 +1854,11 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
                             onClick = {
                                 if (!didDownLongPress && !uiState.isPlaying) {
                                     viewModel.moveCurrentBox(0, moveStepTap, uiState.videoWidth, uiState.videoHeight)
-                                    saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                    viewModel.viewModelScope.launch {
+                                        withContext(Dispatchers.IO) {
+                                            saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                        }
+                                    }
                                 }
                             },
                             interactionSource = downInteractionSource,
@@ -1656,7 +1874,11 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
                         onClick = {
                             if (!didNextLongPress && !uiState.isPlaying) {
                                 viewModel.moveCurrentBox(moveStepTap, 0, uiState.videoWidth, uiState.videoHeight)
-                                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                viewModel.viewModelScope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                                    }
+                                }
                             }
                         },
                         interactionSource = nextInteractionSource,
@@ -1714,21 +1936,30 @@ fun PlaybackControlPanel(uiState: OshiCamUiState, viewModel: OshiCamViewModel, o
                             viewModel.cutFrames.add(uiState.currentFrameIndex)
                             Toast.makeText(context, "このコマからカメラが瞬間移動します", Toast.LENGTH_SHORT).show()
                         }
-                        saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                        // [修正] saveProjectData を IO スレッドで実行
+                        viewModel.viewModelScope.launch {
+                            withContext(Dispatchers.IO) {
+                                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                            }
+                        }
                     },
                     enabled = (!uiState.isPlaying && (uiState.appMode == AppMode.EDITING || uiState.appMode == AppMode.LOCK_ON)),
                     colors = ButtonDefaults.buttonColors(containerColor = if (viewModel.cutFrames.contains(uiState.currentFrameIndex)) Color(0xFFAB47BC) else Color(0xFF673AB7)),
                     modifier = Modifier.weight(1.2f).height(36.dp),
                     contentPadding = PaddingValues(0.dp),
                     shape = RoundedCornerShape(8.dp)
-                ) { Text(if (viewModel.cutFrames.contains(uiState.currentFrameIndex)) "✂️ カット解除" else "✂️ カット指定", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
+                ) { Text(if (viewModel.cutFrames.contains(uiState.currentFrameIndex)) "カット解除" else "カット指定", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
 
                 OutlinedButton(
                     onClick = {
                         viewModel.trackingMap.remove(uiState.currentFrameIndex)
                         viewModel.userKeyframes.remove(uiState.currentFrameIndex)
                         viewModel.interpolatedFrames.remove(uiState.currentFrameIndex)
-                        saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                        viewModel.viewModelScope.launch {
+                            withContext(Dispatchers.IO) {
+                                saveProjectData(context, uiState.selectedFps, viewModel.trackingMap, viewModel.userKeyframes, viewModel.cutFrames, viewModel.interpolatedFrames)
+                            }
+                        }
                         Toast.makeText(context, "枠を外しました", Toast.LENGTH_SHORT).show()
                     },
                     enabled = (!uiState.isPlaying && (uiState.appMode == AppMode.EDITING || uiState.appMode == AppMode.LOCK_ON)),
@@ -1779,6 +2010,7 @@ fun SettingSectionHeader(title: String, description: String? = null) {
 @Composable
 fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport: () -> Unit, context: Context) {
     var showAdvanced by remember { mutableStateOf(false) }
+    val uriHandler = LocalUriHandler.current
 
     val trackingPriorities = listOf("色・柄を優先 (軽量ReID)", "位置・予測を優先 (SORT系)")
     val ratios = listOf("スマホ画面に合わせる (フル)", "9:16 (TikTok等)", "16:9 (YouTube等)", "4:3 (レトロ)", "1:1 (正方形)")
@@ -1793,7 +2025,7 @@ fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport:
     ) {
         Column(modifier = Modifier.padding(8.dp)) {
 
-            Text("⚙️ 設定", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp))
+            Text("設定", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp))
 
             SettingSectionHeader("1. 枠の幅調整 (隣の人との混同防止)", "他の人と重なって1つの枠にされてしまう場合に狭くしてください。")
             Text("${uiState.boxWidthPercent.toInt()}%", fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.End))
@@ -1801,10 +2033,7 @@ fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport:
             Spacer(modifier = Modifier.height(8.dp))
 
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { showAdvanced = !showAdvanced }
-                    .padding(vertical = 8.dp),
+                modifier = Modifier.fillMaxWidth().clickable { showAdvanced = !showAdvanced }.padding(vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -1868,15 +2097,11 @@ fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport:
                 SettingSectionHeader("9. 出力画質")
                 outputResolutions.forEach { res ->
                     val isHighRes = res != "720p (SNS向け・爆速)"
-                    val isEnabled = uiState.isPremiumVersion || !isHighRes
-
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().height(36.dp).clickable(enabled = isEnabled) {
-                        if (isEnabled) viewModel.updateState { it.copy(selectedResolution = res) }
-                    }) {
-                        RadioButton(selected = (uiState.selectedResolution == res), onClick = { if (isEnabled) viewModel.updateState { it.copy(selectedResolution = res) } }, enabled = isEnabled, modifier = Modifier.scale(0.8f))
-                        Text(res, color = if (isEnabled) MaterialTheme.colorScheme.onSurface else Color.Gray, fontSize = 13.sp)
-                        if (!isEnabled) {
-                            Text(" (👑有料版のみ)", fontSize = 10.sp, color = Color(0xFFF57F17), fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 4.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().height(36.dp).clickable { viewModel.updateState { it.copy(selectedResolution = res) } }) {
+                        RadioButton(selected = (uiState.selectedResolution == res), onClick = { viewModel.updateState { it.copy(selectedResolution = res) } }, modifier = Modifier.scale(0.8f))
+                        Text(res, color = MaterialTheme.colorScheme.onSurface, fontSize = 13.sp)
+                        if (!uiState.isPremiumVersion && isHighRes) {
+                            Text(" (5秒お試し)", fontSize = 10.sp, color = Color(0xFFF57F17), fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 4.dp))
                         }
                     }
                 }
@@ -1884,24 +2109,21 @@ fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport:
                 Divider(modifier = Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.surfaceVariant)
             }
 
-            // 有料版エリア
             ElevatedCard(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.elevatedCardColors(containerColor = Color(0xFFFFF8E1)),
                 elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)
             ) {
-                Column(modifier = Modifier.padding(8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                        Text("👑 プレミアム設定", style = MaterialTheme.typography.titleSmall, color = Color(0xFFF57F17), fontWeight = FontWeight.ExtraBold)
-                        Switch(
-                            checked = uiState.isPremiumVersion,
-                            onCheckedChange = { viewModel.updateState { state -> state.copy(isPremiumVersion = it) } },
-                            colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFFF57F17), checkedTrackColor = Color(0xFFF57F17).copy(alpha = 0.5f)),
-                            modifier = Modifier.scale(0.7f)
-                        )
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Text("プレミアム設定", style = MaterialTheme.typography.titleSmall, color = Color(0xFFF57F17), fontWeight = FontWeight.ExtraBold)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        if (uiState.isPremiumVersion) {
+                            Badge(containerColor = Color(0xFF2E7D32)) { Text("有効", color = Color.White) }
+                        }
                     }
                     if (!uiState.isPremiumVersion) {
-                        Text("※無料版は7秒お試し出力・ロゴ透かし・広告あり", fontSize = 11.sp, color = Color.DarkGray, modifier = Modifier.padding(vertical = 2.dp))
+                        Text("※無料版の720p出力は秒数無制限！(ロゴ・広告あり)\n※高画質出力は最初の5秒間のお試しになります。\n※有料版は全機能解放＆バックグラウンド処理対応！\n(※処理中はタスクキルしないでください)", fontSize = 11.sp, color = Color.DarkGray, modifier = Modifier.padding(vertical = 4.dp))
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             val currentActivity = LocalContext.current as? Activity
                             Button(
@@ -1911,32 +2133,45 @@ fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport:
                                     }
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF57F17)),
-                                modifier = Modifier.weight(1f).height(36.dp),
-                                shape = RoundedCornerShape(8.dp),
-                                contentPadding = PaddingValues(0.dp)
-                            ) { Text("有料版を試す", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                                modifier = Modifier.weight(1f).height(44.dp),
+                                shape = RoundedCornerShape(8.dp)
+                            ) { Text("定期購入へ進む", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
 
                             OutlinedButton(
                                 onClick = {
-                                    Purchases.sharedInstance.restorePurchasesWith(
-                                        onSuccess = { customerInfo ->
-                                            if (customerInfo.entitlements["premium"]?.isActive == true) {
-                                                viewModel.updateState { it.copy(isPremiumVersion = true) }
-                                                Toast.makeText(context, "購入状態を復元しました", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                Toast.makeText(context, "有効な購入履歴がありません", Toast.LENGTH_SHORT).show()
-                                            }
-                                        },
-                                        onError = { error -> Toast.makeText(context, "復元エラー: ${error.message}", Toast.LENGTH_SHORT).show() }
-                                    )
+                                    try {
+                                        Purchases.sharedInstance.restorePurchasesWith(
+                                            onSuccess = { customerInfo ->
+                                                if (customerInfo.entitlements["premium"]?.isActive == true) {
+                                                    viewModel.updateState { it.copy(isPremiumVersion = true) }
+                                                    Toast.makeText(context, "購入状態を復元しました", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "有効な購入履歴がありません", Toast.LENGTH_SHORT).show()
+                                                }
+                                            },
+                                            onError = { error -> Toast.makeText(context, "復元エラー: ${error.message}", Toast.LENGTH_SHORT).show() }
+                                        )
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "課金システムエラー: ${e.message}", Toast.LENGTH_SHORT).show()
+                                    }
                                 },
-                                modifier = Modifier.weight(1f).height(36.dp),
-                                shape = RoundedCornerShape(8.dp),
-                                contentPadding = PaddingValues(0.dp)
-                            ) { Text("購入の復元", color = Color(0xFFF57F17), fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                                modifier = Modifier.weight(1f).height(44.dp),
+                                shape = RoundedCornerShape(8.dp)
+                            ) { Text("購入の復元", color = Color(0xFFF57F17), fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+                        }
+
+                        // [修正] 利用規約・プライバシーポリシーのURLを正しいものに必ず差し替えてください
+                        Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
+                            Text("利用規約", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, textDecoration = TextDecoration.Underline, modifier = Modifier.clickable {
+                                uriHandler.openUri("https://あなたの利用規約ページのURLをここに入れてください")
+                            })
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text("プライバシーポリシー", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, textDecoration = TextDecoration.Underline, modifier = Modifier.clickable {
+                                uriHandler.openUri("https://あなたのプライバシーポリシーページのURLをここに入れてください")
+                            })
                         }
                     } else {
-                        Text("✅ プレミアム機能が有効です(フル出力/高画質/広告なし)", fontSize = 11.sp, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 2.dp))
+                        Text("プレミアム機能が有効です(フル出力/高画質/広告なし/バックグラウンド処理)\n(※処理中はタスクキルしないでください)", fontSize = 11.sp, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 4.dp))
                     }
                 }
             }
@@ -1952,7 +2187,7 @@ fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport:
                     elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp)
                 ) {
                     Text(
-                        text = if (uiState.isBackgroundExtracting) "展開完了までお待ちください..." else "✨ 音付きで動画を書き出す",
+                        text = if (uiState.isBackgroundExtracting) "展開完了までお待ちください..." else "音付きで動画を書き出す",
                         color = MaterialTheme.colorScheme.onPrimary,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.ExtraBold
@@ -2021,6 +2256,7 @@ suspend fun loadFromSlot(context: Context, slot: Int): Boolean = withContext(Dis
     }
 }
 
+// [修正] saveProjectData / loadProjectData を通常関数のままにし、呼び出し側で withContext(Dispatchers.IO) を使用
 fun saveProjectData(context: Context, fps: Int, trackingMap: Map<Int, Rect>, userKeyframes: List<Int>, cutFrames: List<Int>, interpolatedFrames: List<Int>) {
     try {
         val file = File(context.filesDir, "project_data.txt")
@@ -2106,7 +2342,7 @@ suspend fun runAutoTracking(
                 val options = BitmapFactory.Options().apply { inSampleSize = 2; inPreferredConfig = Bitmap.Config.RGB_565 }
                 startBmp = BitmapFactory.decodeFile(initialFrames[startStep].absolutePath, options)
             }
-        } catch (e: Exception) {}
+        } catch (e: Exception) { Log.e("AutoTracking", "開始フレーム読み込みエラー", e) }
 
         if (startBmp == null) return@withContext null
 
@@ -2167,80 +2403,10 @@ suspend fun runAutoTracking(
                 val rawObjs = detectObjectsSync(objDetector, image)
                 val rawFaces = detectFacesSync(faceDetector, image)
 
-                val faceBoxes = rawFaces.mapNotNull { f ->
-                    val fw = f.width() * scaleFactor
-                    val fh = f.height() * scaleFactor
-                    if (fw < imgW * 0.005f) return@mapNotNull null
-                    val fl = f.left * scaleFactor
-                    val ft = f.top * scaleFactor
-                    val fr = f.right * scaleFactor
-                    val fb = f.bottom * scaleFactor
-                    Rect(
-                        max(0, (fl - fw * 2.0f).toInt()),
-                        max(0, (ft - fh * 1.5f).toInt()),
-                        min(imgW, (fr + fw * 2.0f).toInt()),
-                        min(imgH, (fb + fh * 4.5f).toInt())
-                    )
-                }
-
-                val objBoxes = rawObjs.map { o ->
-                    Rect(
-                        (o.left * scaleFactor).toInt(),
-                        (o.top * scaleFactor).toInt(),
-                        (o.right * scaleFactor).toInt(),
-                        (o.bottom * scaleFactor).toInt()
-                    )
-                }.filter { box ->
-                    val w = box.width().toFloat()
-                    val h = box.height().toFloat()
-                    w > imgW * 0.03f && h > imgH * 0.05f
-                }
-
-                val mergedCandidates = mutableListOf<Rect>()
-                val usedObjBoxes = mutableSetOf<Rect>()
-
-                for (faceBox in faceBoxes) {
-                    var bestObj: Rect? = null
-                    var maxIntersectArea = 0
-                    for (objBox in objBoxes) {
-                        val intersect = Rect()
-                        if (intersect.setIntersect(faceBox, objBox)) {
-                            val area = intersect.width() * intersect.height()
-                            if (area > maxIntersectArea) {
-                                maxIntersectArea = area
-                                bestObj = objBox
-                            }
-                        }
-                    }
-                    if (bestObj != null) {
-                        val unionBox = Rect(faceBox)
-                        unionBox.union(bestObj)
-                        mergedCandidates.add(unionBox)
-                        usedObjBoxes.add(bestObj)
-                    } else {
-                        mergedCandidates.add(faceBox)
-                    }
-                }
-
-                for (objBox in objBoxes) {
-                    if (!usedObjBoxes.contains(objBox)) {
-                        val isTracked = Rect.intersects(objBox, lastBox)
-                        val ratio = objBox.height().toFloat() / objBox.width().toFloat()
-                        if (isTracked || ratio in 0.8f..4.5f) {
-                            mergedCandidates.add(objBox)
-                        }
-                    }
-                }
-
-                val narrowedCandidates = mergedCandidates.map { box ->
-                    if (boxWidthPercent >= 100f) box else {
-                        val cx = box.centerX()
-                        val newW = (box.width() * (boxWidthPercent / 100f)).toInt()
-                        Rect(cx - newW / 2, box.top, cx + newW / 2, box.bottom)
-                    }
-                }
-
-                val newFilteredObjs = removeOverlappingBoxes(narrowedCandidates)
+                // [修正] 共通関数 mergeDetectionBoxes を使用（重複コード廃止）
+                val newFilteredObjs = mergeDetectionBoxes(
+                    rawObjs, rawFaces, scaleFactor, imgW, imgH, boxWidthPercent, lastBox
+                )
 
                 val predX = lastBox.centerX().toFloat() + velocityX
                 val predY = lastBox.centerY().toFloat() + velocityY
@@ -2255,7 +2421,7 @@ suspend fun runAutoTracking(
                     val evalBox = Rect((box.left / scaleFactor).toInt(), (box.top / scaleFactor).toInt(), (box.right / scaleFactor).toInt(), (box.bottom / scaleFactor).toInt())
 
                     val currEmbedding = getSpatialEmbedding(bitmap, evalBox)
-                    var score = calculateReIDScore(lastBox, box, currEmbedding, lastKnownEmbedding, masterEmbedding, predX, py = predY, trackingPriority)
+                    val score = calculateReIDScore(lastBox, box, currEmbedding, lastKnownEmbedding, masterEmbedding, predX, py = predY, trackingPriority)
 
                     if (score > bestS) {
                         bestS = score
@@ -2319,7 +2485,7 @@ suspend fun runAutoTracking(
                     try {
                         val uiOptions = BitmapFactory.Options().apply { inSampleSize = 4; inPreferredConfig = Bitmap.Config.RGB_565 }
                         previewBmp = BitmapFactory.decodeFile(currentFrames[step].absolutePath, uiOptions)
-                    } catch (e: Exception) {}
+                    } catch (e: Exception) { Log.e("AutoTracking", "プレビュー読み込みエラー", e) }
                 }
 
                 withContext(Dispatchers.Main) { onFrameUpdate(step, if (isFound) lastBox else null, newFilteredObjs, previewBmp) }
@@ -2332,7 +2498,7 @@ suspend fun runAutoTracking(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
-        e.printStackTrace()
+        Log.e("AutoTracking", "追従中にエラーが発生", e)
     } finally {
         objDetector?.close()
         faceDetector?.close()
@@ -2377,9 +2543,9 @@ fun getSpatialEmbedding(bitmap: Bitmap, bounds: Rect): FloatArray {
             val avgSinHS = sumSinHS / 9f
             val avgV = sumV / 9f
 
-            embedding[index++] = avgCosHS // -1 ~ 1
-            embedding[index++] = avgSinHS // -1 ~ 1
-            embedding[index++] = avgV     // 0 ~ 1
+            embedding[index++] = avgCosHS
+            embedding[index++] = avgSinHS
+            embedding[index++] = avgV
         }
     }
 
@@ -2500,6 +2666,10 @@ suspend fun processVideoProfessional(
 ): File? = withContext(Dispatchers.IO) {
 
     try {
+        if (isPremium) {
+            VideoProcessingService.start(context, "書き出しの準備中...")
+        }
+
         val startTimeMs = System.currentTimeMillis()
         val exportFps = if (isSmoothExport && selectedFps < 30) 30 else selectedFps
 
@@ -2533,7 +2703,12 @@ suspend fun processVideoProfessional(
             } else {
                 "残り時間計算中..."
             }
-            onProgress("$phaseMsg\n全体進捗: $overallPercentInt%\n$etaStr")
+            val fullMessage = "$phaseMsg\n全体進捗: $overallPercentInt%\n$etaStr"
+            onProgress(fullMessage)
+
+            if (isPremium) {
+                VideoProcessingService.update(context, phaseMsg, overallPercentInt)
+            }
         }
 
         val exportFramesDir = File(context.cacheDir, "export_frames")
@@ -2542,25 +2717,35 @@ suspend fun processVideoProfessional(
 
         reportProgress("準備中 (最高画質データ生成)", 0f, p1Base, p1Weight)
 
-        // ★画質の検証結果: 以前のコードでは、UI処理用の軽量フレームを書き出しに使い回す設定が残っていました。
-        // これを排除し、書き出し時は必ず「元動画から本来の解像度のまま最高品質(qscale:v 1)で再展開」するように修正しました。
+        val isHighRes = resolutionSetting != "720p (SNS向け・爆速)"
+        val timeLimitOption = if (!isPremium && isHighRes) "-t 5" else ""
+
         val scaleFilter = "-vf fps=$exportFps"
-        val command = "-y -threads 0 -i '${originalVideo.absolutePath}' $scaleFilter -qscale:v 1 '${exportFramesDir.absolutePath}/frame_%05d.jpg'"
+
+        val command = if (timeLimitOption.isNotEmpty()) {
+            "-y -threads 0 -i '${originalVideo.absolutePath}' $timeLimitOption $scaleFilter -qscale:v 1 '${exportFramesDir.absolutePath}/frame_%05d.jpg'"
+        } else {
+            "-y -threads 0 -i '${originalVideo.absolutePath}' $scaleFilter -qscale:v 1 '${exportFramesDir.absolutePath}/frame_%05d.jpg'"
+        }
 
         val successPhase1 = suspendCancellableCoroutine<Boolean> { cont ->
             val session = FFmpegKit.executeAsync(command,
                 { session ->
                     if (cont.isActive) {
                         if (isCancelled() || session.returnCode.isValueCancel) {
-                            cont.resumeWith(Result.failure(CancellationException("Cancelled")))
+                            cont.resume(false)
                         } else {
                             cont.resume(session.returnCode.isValueSuccess)
                         }
                     }
                 },
-                { log -> },
+                { _ -> },
                 { statistics ->
-                    val expectedFrames = frameFiles.size * (exportFps.toFloat() / selectedFps.toFloat())
+                    val expectedFrames = if (!isPremium && isHighRes) {
+                        5 * exportFps.toFloat()
+                    } else {
+                        frameFiles.size * (exportFps.toFloat() / selectedFps.toFloat())
+                    }
                     if (expectedFrames > 0) {
                         val percent = (statistics.videoFrameNumber.toFloat() / expectedFrames * 100f).coerceIn(0f, 100f)
                         reportProgress("準備中 (最高画質データ生成)", percent, p1Base, p1Weight)
@@ -2571,13 +2756,13 @@ suspend fun processVideoProfessional(
         }
         viewModel.activeFfmpegSessionId = null
 
-        if (isCancelled()) throw CancellationException("Export cancelled")
+        if (isCancelled()) return@withContext null
         if (!successPhase1) throw Exception("補間データの生成に失敗しました")
 
         val fullExportFrameFiles = exportFramesDir.listFiles()?.filter { it.extension == "jpg" }?.sortedBy { it.name } ?: emptyList()
         if (fullExportFrameFiles.isEmpty()) throw Exception("出力用フレームが見つかりません")
 
-        val maxAllowedFrames = if (!isPremium) 7 * exportFps else fullExportFrameFiles.size
+        val maxAllowedFrames = if (!isPremium && isHighRes) 5 * exportFps else fullExportFrameFiles.size
         val exportFrameFiles = fullExportFrameFiles.take(maxAllowedFrames)
 
         val editOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -2680,12 +2865,10 @@ suspend fun processVideoProfessional(
             editCamY[i] = curCamY
         }
 
-        val fullExportFrameCount = fullExportFrameFiles.size
-        val fpsRatioFloat = (frameFiles.size - 1).toFloat() / max(1, fullExportFrameCount - 1).toFloat()
+        val fpsRatioFloat = selectedFps.toFloat() / exportFps.toFloat()
 
         var completedFrames = 0
 
-        // メモリ計算しつつ安全なマルチスレッドを確保
         val maxMemMB = Runtime.getRuntime().maxMemory() / (1024 * 1024)
         val chunkSize = when {
             resolutionSetting == "4K (Ultra HD)" -> 1
@@ -2695,9 +2878,10 @@ suspend fun processVideoProfessional(
         }
 
         for (chunk in exportFrameFiles.indices.chunked(chunkSize)) {
-            // ★不具合の検証結果: 停止判定の強化
-            // ループ内部にisCancelled()を組み込み、停止ボタンが押された瞬間に安全にループを抜け出すよう修正
-            if (!isActive || isCancelled()) throw CancellationException("Cancelled by user")
+            if (!isActive || isCancelled()) {
+                System.gc()
+                return@withContext null
+            }
             withContext(Dispatchers.Default) {
                 chunk.map { j ->
                     async {
@@ -2729,25 +2913,24 @@ suspend fun processVideoProfessional(
                             val decoder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                                 BitmapRegionDecoder.newInstance(exportFrameFiles[j].absolutePath)
                             } else {
+                                @Suppress("DEPRECATION")
                                 BitmapRegionDecoder.newInstance(exportFrameFiles[j].absolutePath, false)
                             }
 
                             if (decoder != null) {
                                 val cropRect = Rect(safeX, safeY, safeX + cropW, safeY + cropH)
-                                // ★画質優先: 完全フルカラー（ARGB_8888）でデコードし、のっぺり感を排除
-                                val decodeOptions = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+                                val decodeOptions = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
                                 croppedBitmap = decoder.decodeRegion(cropRect, decodeOptions)
                                 decoder.recycle()
                             }
-                        } catch (e: Throwable) {}
+                        } catch (e: Exception) {
+                            Log.e("Export", "BitmapRegionDecoder エラー (j=$j)", e)
+                        }
 
                         if (croppedBitmap == null) {
                             try {
-                                val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                                BitmapFactory.decodeFile(exportFrameFiles[j].absolutePath, boundsOptions)
-
                                 val decodeOptions = BitmapFactory.Options().apply {
-                                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                                    inPreferredConfig = Bitmap.Config.RGB_565
                                 }
                                 val fullBmp = BitmapFactory.decodeFile(exportFrameFiles[j].absolutePath, decodeOptions)
 
@@ -2763,7 +2946,7 @@ suspend fun processVideoProfessional(
                                     fullBmp.recycle()
                                 }
                             } catch(e: Throwable) {
-                                e.printStackTrace()
+                                Log.e("Export", "フルBitmapクロップ失敗 (j=$j)", e)
                             }
                         }
 
@@ -2772,28 +2955,27 @@ suspend fun processVideoProfessional(
                         try {
                             if (croppedBitmap != null) {
                                 if (!isPremium) {
-                                    val mutableBmp = croppedBitmap.copy(Bitmap.Config.ARGB_8888, true)
+                                    val mutableBmp = croppedBitmap.copy(Bitmap.Config.RGB_565, true)
                                     val canvas = android.graphics.Canvas(mutableBmp)
                                     val paint = android.graphics.Paint().apply {
                                         color = android.graphics.Color.WHITE
-                                        alpha = 150
+                                        alpha = 180
                                         textSize = mutableBmp.width * 0.05f
                                         isAntiAlias = true
-                                        setShadowLayer(5f, 2f, 2f, android.graphics.Color.BLACK)
+                                        setShadowLayer(3f, 1f, 1f, android.graphics.Color.BLACK)
                                     }
                                     val text = "OshiCam"
                                     val textWidth = paint.measureText(text)
                                     canvas.drawText(text, mutableBmp.width - textWidth - (mutableBmp.width * 0.05f), mutableBmp.height - (mutableBmp.height * 0.05f), paint)
 
-                                    // ★画質優先: 最高品質の 100 に固定し、モスキートノイズを排除
-                                    FileOutputStream(outFile).use { outStream -> mutableBmp.compress(Bitmap.CompressFormat.JPEG, 100, outStream) }
+                                    FileOutputStream(outFile).use { outStream -> mutableBmp.compress(Bitmap.CompressFormat.JPEG, 90, outStream) }
                                     mutableBmp.recycle()
                                 } else {
-                                    FileOutputStream(outFile).use { outStream -> croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 100, outStream) }
+                                    FileOutputStream(outFile).use { outStream -> croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outStream) }
                                 }
                             }
                         } catch (e: Throwable) {
-                            e.printStackTrace()
+                            Log.e("Export", "フレーム書き込みエラー (j=$j)", e)
                         } finally {
                             croppedBitmap?.recycle()
                         }
@@ -2835,24 +3017,27 @@ suspend fun processVideoProfessional(
         reportProgress("最終動画データを生成中", 0f, p3Base, p3Weight)
         val outputFile = File(context.cacheDir, "output.mp4")
 
-        // ★画質優先: エンコーダーを libx264 にし、CRF 16 + -preset slow で究極の画質を担保
-        val commandFinal = "-y -framerate $exportFps -start_number 0 -i '${croppedDir.absolutePath}/frame_%05d.jpg' -i '${originalVideo.absolutePath}' -map 0:v:0 -map 1:a:0? -vf \"scale=$outW:$outH:flags=lanczos\" -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:v libx264 -crf 16 -preset slow -pix_fmt yuv420p -c:a aac -b:a 192k -ar 44100 -shortest '${outputFile.absolutePath}'"
+        val timeLimitOptionForEncode = if (!isPremium && isHighRes) "-t 5" else ""
+        val commandFinal = if (timeLimitOptionForEncode.isNotEmpty()) {
+            "-y -framerate $exportFps -start_number 0 -i '${croppedDir.absolutePath}/frame_%05d.jpg' $timeLimitOptionForEncode -i '${originalVideo.absolutePath}' -map 0:v:0 -map 1:a:0? -vf \"scale=$outW:$outH:flags=lanczos\" -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:v libx264 -crf 18 -preset fast -pix_fmt yuv420p -c:a aac -b:a 192k -ar 44100 -shortest '${outputFile.absolutePath}'"
+        } else {
+            "-y -framerate $exportFps -start_number 0 -i '${croppedDir.absolutePath}/frame_%05d.jpg' -i '${originalVideo.absolutePath}' -map 0:v:0 -map 1:a:0? -vf \"scale=$outW:$outH:flags=lanczos\" -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:v libx264 -crf 18 -preset fast -pix_fmt yuv420p -c:a aac -b:a 192k -ar 44100 -shortest '${outputFile.absolutePath}'"
+        }
 
         val totalFrames = exportFrameFiles.size
 
         val successPhase3 = suspendCancellableCoroutine<Boolean> { cont ->
             val session = FFmpegKit.executeAsync(commandFinal,
                 { session ->
-                    val returnCode = session.returnCode
                     if (cont.isActive) {
-                        if (isCancelled() || returnCode.isValueCancel) {
-                            cont.resumeWith(Result.failure(CancellationException("Cancelled")))
+                        if (isCancelled() || session.returnCode.isValueCancel) {
+                            cont.resume(false)
                         } else {
-                            cont.resume(returnCode.isValueSuccess)
+                            cont.resume(session.returnCode.isValueSuccess)
                         }
                     }
                 },
-                { log -> },
+                { _ -> },
                 { statistics ->
                     if (totalFrames > 0) {
                         val percent = (statistics.videoFrameNumber.toFloat() / totalFrames * 100f).coerceIn(0f, 100f)
@@ -2864,23 +3049,25 @@ suspend fun processVideoProfessional(
         }
         viewModel.activeFfmpegSessionId = null
 
-        if (isCancelled()) throw CancellationException("Export cancelled")
-        if (!successPhase3) throw Exception("動画のエンコードに失敗しました")
+        if (isCancelled()) return@withContext null
+        if (!successPhase3) throw Exception("動画のエンコードに失敗しました。")
 
         croppedDir.listFiles()?.forEach { it.deleteRecursively() }
         exportFramesDir.listFiles()?.forEach { it.deleteRecursively() }
         outputFile
 
     } catch (e: Throwable) {
-        if (e is CancellationException) {
-            // キャンセル時は例外を再スローし、呼び出し元で正常に中断処理させる
-            throw e
-        }
-        withContext(Dispatchers.Main) {
-            Toast.makeText(contextForToast, "⚠️ 書き出し処理を安全に中断しました。\n(${e.message})", Toast.LENGTH_LONG).show()
-        }
         System.gc()
+        if (!isCancelled()) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(contextForToast, "エラーが発生しました。\n(${e.message})", Toast.LENGTH_LONG).show()
+            }
+        }
         null
+    } finally {
+        if (isPremium) {
+            VideoProcessingService.stop(context)
+        }
     }
 }
 
@@ -2909,38 +3096,43 @@ suspend fun saveVideoToGallery(context: Context, video: File) {
                 }
             } catch (e: Exception) {
                 resolver.delete(uri, null, null)
-                e.printStackTrace()
+                Log.e("Gallery", "ギャラリー保存エラー", e)
             }
         }
     }
 }
 
 fun purchasePremium(activity: Activity, onResult: (Boolean) -> Unit) {
-    Purchases.sharedInstance.getOfferingsWith(
-        onSuccess = { offerings ->
-            val packageToBuy = offerings.current?.monthly
-            if (packageToBuy != null) {
-                val params = PurchaseParams.Builder(activity, packageToBuy).build()
-                Purchases.sharedInstance.purchaseWith(
-                    params,
-                    onSuccess = { _, customerInfo ->
-                        if (customerInfo.entitlements["premium"]?.isActive == true) {
-                            Toast.makeText(activity, "プレミアム版にアップグレードしました！", Toast.LENGTH_LONG).show()
-                            onResult(true)
+    try {
+        Purchases.sharedInstance.getOfferingsWith(
+            onSuccess = { offerings ->
+                val packageToBuy = offerings.current?.monthly
+                if (packageToBuy != null) {
+                    val params = PurchaseParams.Builder(activity, packageToBuy).build()
+                    Purchases.sharedInstance.purchaseWith(
+                        params,
+                        onSuccess = { _, customerInfo ->
+                            if (customerInfo.entitlements["premium"]?.isActive == true) {
+                                Toast.makeText(activity, "プレミアム版にアップグレードしました！", Toast.LENGTH_LONG).show()
+                                onResult(true)
+                            }
+                        },
+                        onError = { error, userCancelled ->
+                            if (!userCancelled) {
+                                Toast.makeText(activity, "エラー: ${error.message}", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                    },
-                    onError = { error, userCancelled ->
-                        if (!userCancelled) {
-                            Toast.makeText(activity, "エラー: ${error.message}", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                )
-            } else {
-                Toast.makeText(activity, "プランが見つかりません", Toast.LENGTH_SHORT).show()
+                    )
+                } else {
+                    Toast.makeText(activity, "プランが見つかりません", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onError = {
+                Toast.makeText(activity, "通信エラーが発生しました", Toast.LENGTH_SHORT).show()
             }
-        },
-        onError = {
-            Toast.makeText(activity, "通信エラーが発生しました", Toast.LENGTH_SHORT).show()
-        }
-    )
+        )
+    } catch (e: Exception) {
+        Toast.makeText(activity, "課金システムエラー: ${e.message}", Toast.LENGTH_LONG).show()
+        e.printStackTrace()
+    }
 }
