@@ -2163,11 +2163,11 @@ fun SettingsCard(uiState: OshiCamUiState, viewModel: OshiCamViewModel, onExport:
                         // [修正] 利用規約・プライバシーポリシーのURLを正しいものに必ず差し替えてください
                         Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
                             Text("利用規約", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, textDecoration = TextDecoration.Underline, modifier = Modifier.clickable {
-                                uriHandler.openUri("https://あなたの利用規約ページのURLをここに入れてください")
+                                uriHandler.openUri("https://sites.google.com/view/oshicam100/%E3%83%9B%E3%83%BC%E3%83%A0")
                             })
                             Spacer(modifier = Modifier.width(12.dp))
                             Text("プライバシーポリシー", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, textDecoration = TextDecoration.Underline, modifier = Modifier.clickable {
-                                uriHandler.openUri("https://あなたのプライバシーポリシーページのURLをここに入れてください")
+                                uriHandler.openUri("https://sites.google.com/view/oshicam100/%E3%83%9B%E3%83%BC%E3%83%A0")
                             })
                         }
                     } else {
